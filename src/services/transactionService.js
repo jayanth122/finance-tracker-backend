@@ -14,6 +14,75 @@ const baseSelect = `
   subcategory:subcategories(id, name)
 `;
 
+let transactionsColumnSet = null;
+
+const getTransactionsColumnSet = async () => {
+  if (transactionsColumnSet) return transactionsColumnSet;
+
+  const { data, error } = await supabase
+    .from('information_schema.columns')
+    .select('column_name')
+    .eq('table_schema', 'public')
+    .eq('table_name', 'transactions');
+
+  if (error || !data || data.length === 0) {
+    // Safe fallback for deployments where information_schema access is restricted.
+    transactionsColumnSet = new Set([
+      'user_id',
+      'date',
+      'amount',
+      'type',
+      'account_id',
+      'category_id',
+      'subcategory_id',
+      'note',
+      'description',
+    ]);
+    return transactionsColumnSet;
+  }
+
+  transactionsColumnSet = new Set(data.map((column) => column.column_name));
+  return transactionsColumnSet;
+};
+
+const sanitizeTransactionInsertPayload = async (payload) => {
+  const columns = await getTransactionsColumnSet();
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => columns.has(key)));
+};
+
+const extractMissingColumnFromError = (errorMessage = '') => {
+  const match = /Could not find the '([^']+)' column/.exec(errorMessage);
+  return match ? match[1] : null;
+};
+
+const insertTransactionsWithSchemaFallback = async (rows, maxRetries = 5) => {
+  let payloadRows = rows.map((row) => ({ ...row }));
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const { data, error } = await supabase
+      .from('transactions')
+      .insert(payloadRows)
+      .select(baseSelect);
+
+    if (!error) {
+      return data;
+    }
+
+    const missingColumn = extractMissingColumnFromError(error.message);
+    if (!missingColumn || attempt === maxRetries) {
+      throw error;
+    }
+
+    payloadRows = payloadRows.map((row) => {
+      const next = { ...row };
+      delete next[missingColumn];
+      return next;
+    });
+  }
+
+  return [];
+};
+
 const getAllTransactions = async (userId, filters = {}) => {
   let query = supabase
     .from('transactions')
@@ -75,6 +144,8 @@ const setAccountBalance = async (userId, accountId, newBalance) => {
 
 const createTransaction = async (userId, payload) => {
   const { amount, type, account_id, from_account, to_account } = payload;
+  const sourceAccountId = from_account || account_id;
+  const destinationAccountId = to_account || account_id;
 
   try {
     // Helper function to update account balance
@@ -103,21 +174,21 @@ const createTransaction = async (userId, payload) => {
       await updateAccountBalance(account_id, amount);
     } else if (type === 'expense' && account_id) {
       await updateAccountBalance(account_id, -amount);
-    } else if (type === 'transfer_out' && from_account) {
-      await updateAccountBalance(from_account, -amount);
-    } else if (type === 'transfer_in' && to_account) {
-      await updateAccountBalance(to_account, amount);
+    } else if (type === 'transfer_out' && sourceAccountId) {
+      await updateAccountBalance(sourceAccountId, -amount);
+    } else if (type === 'transfer_in' && destinationAccountId) {
+      await updateAccountBalance(destinationAccountId, amount);
     }
 
-    // Insert transaction
-    const { data, error } = await supabase
-      .from('transactions')
-      .insert({ ...payload, user_id: userId })
-      .select(baseSelect)
-      .single();
+    const insertPayload = await sanitizeTransactionInsertPayload({
+      ...payload,
+      account_id: payload.account_id || sourceAccountId || destinationAccountId,
+      user_id: userId,
+    });
 
-    if (error) throw error;
-    return data;
+    // Insert transaction
+    const data = await insertTransactionsWithSchemaFallback([insertPayload]);
+    return data[0] || null;
   } catch (err) {
     throw new Error(`Transaction creation failed: ${err.message}`);
   }
@@ -164,8 +235,6 @@ const createTransfer = async (userId, payload) => {
     const baseTransferPayload = {
       date,
       amount: numericAmount,
-      from_account,
-      to_account,
       category_id,
       subcategory_id,
       description,
@@ -173,23 +242,19 @@ const createTransfer = async (userId, payload) => {
       user_id: userId,
     };
 
-    const { data, error } = await supabase
-      .from('transactions')
-      .insert([
-        {
-          ...baseTransferPayload,
-          type: 'transfer_out',
-          account_id: from_account,
-        },
-        {
-          ...baseTransferPayload,
-          type: 'transfer_in',
-          account_id: to_account,
-        },
-      ])
-      .select(baseSelect);
+    const transferOutPayload = await sanitizeTransactionInsertPayload({
+      ...baseTransferPayload,
+      type: 'transfer_out',
+      account_id: from_account,
+    });
 
-    if (error) throw error;
+    const transferInPayload = await sanitizeTransactionInsertPayload({
+      ...baseTransferPayload,
+      type: 'transfer_in',
+      account_id: to_account,
+    });
+
+    const data = await insertTransactionsWithSchemaFallback([transferOutPayload, transferInPayload]);
     createdTransactions = data || [];
 
     return {
@@ -216,7 +281,9 @@ const createTransfer = async (userId, payload) => {
       throw new Error(`Transfer failed and rollback failed: ${rollbackError.message}`);
     }
 
-    throw new Error(`Transfer creation failed: ${err.message}`);
+    const wrappedError = new Error(`Transfer creation failed: ${err.message}`);
+    wrappedError.status = err.status || 500;
+    throw wrappedError;
   }
 };
 
