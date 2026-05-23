@@ -1,11 +1,17 @@
-const supabase = require('../config/supabase');
 const crypto = require('crypto');
+const supabase = require('../config/supabase');
 
-const createNotFoundError = (message) => {
-  const error = new Error(message);
-  error.status = 404;
-  return error;
-};
+const FALLBACK_TRANSACTION_COLUMNS = new Set([
+  'user_id',
+  'date',
+  'amount',
+  'type',
+  'account_id',
+  'category_id',
+  'subcategory_id',
+  'note',
+  'description',
+]);
 
 const baseSelect = `
   *,
@@ -15,6 +21,26 @@ const baseSelect = `
 `;
 
 let transactionsColumnSet = null;
+
+const createNotFoundError = (message) => {
+  const error = new Error(message);
+  error.status = 404;
+  return error;
+};
+
+const createBadRequestError = (message) => {
+  const error = new Error(message);
+  error.status = 400;
+  return error;
+};
+
+const toNumericAmount = (amount) => {
+  const value = Number(amount);
+  if (!Number.isFinite(value)) {
+    throw createBadRequestError('Amount must be a valid number.');
+  }
+  return value;
+};
 
 const getTransactionsColumnSet = async () => {
   if (transactionsColumnSet) return transactionsColumnSet;
@@ -26,18 +52,7 @@ const getTransactionsColumnSet = async () => {
     .eq('table_name', 'transactions');
 
   if (error || !data || data.length === 0) {
-    // Safe fallback for deployments where information_schema access is restricted.
-    transactionsColumnSet = new Set([
-      'user_id',
-      'date',
-      'amount',
-      'type',
-      'account_id',
-      'category_id',
-      'subcategory_id',
-      'note',
-      'description',
-    ]);
+    transactionsColumnSet = FALLBACK_TRANSACTION_COLUMNS;
     return transactionsColumnSet;
   }
 
@@ -64,9 +79,7 @@ const insertTransactionsWithSchemaFallback = async (rows, maxRetries = 5) => {
       .insert(payloadRows)
       .select(baseSelect);
 
-    if (!error) {
-      return data;
-    }
+    if (!error) return data;
 
     const missingColumn = extractMissingColumnFromError(error.message);
     if (!missingColumn || attempt === maxRetries) {
@@ -74,13 +87,90 @@ const insertTransactionsWithSchemaFallback = async (rows, maxRetries = 5) => {
     }
 
     payloadRows = payloadRows.map((row) => {
-      const next = { ...row };
-      delete next[missingColumn];
-      return next;
+      const nextRow = { ...row };
+      delete nextRow[missingColumn];
+      return nextRow;
     });
   }
 
   return [];
+};
+
+const getAccountById = async (userId, accountId) => {
+  const { data, error } = await supabase
+    .from('accounts')
+    .select('id, opening_balance')
+    .eq('user_id', userId)
+    .eq('id', accountId)
+    .single();
+
+  if (error || !data) {
+    throw createNotFoundError(`Account not found: ${accountId}`);
+  }
+
+  return data;
+};
+
+const setAccountBalance = async (userId, accountId, newBalance) => {
+  const { error } = await supabase
+    .from('accounts')
+    .update({ opening_balance: newBalance })
+    .eq('user_id', userId)
+    .eq('id', accountId);
+
+  if (error) {
+    throw new Error(`Failed to update account ${accountId}: ${error.message}`);
+  }
+};
+
+const applyBalanceDelta = async (userId, deltaByAccountId) => {
+  for (const [accountId, delta] of Object.entries(deltaByAccountId)) {
+    const numericDelta = Number(delta || 0);
+    if (!numericDelta) continue;
+
+    const account = await getAccountById(userId, accountId);
+    const nextBalance = Number(account.opening_balance || 0) + numericDelta;
+    await setAccountBalance(userId, accountId, nextBalance);
+  }
+};
+
+const invertDelta = (deltaByAccountId) => {
+  return Object.fromEntries(
+    Object.entries(deltaByAccountId).map(([accountId, delta]) => [accountId, -Number(delta || 0)])
+  );
+};
+
+const getSignedAmountImpact = (type, amount) => {
+  const numericAmount = toNumericAmount(amount);
+  if (type === 'income' || type === 'transfer_in') return numericAmount;
+  if (type === 'expense' || type === 'transfer_out') return -numericAmount;
+  return 0;
+};
+
+const getTransactionImpactByAccount = (transaction) => {
+  if (!transaction?.account_id) return {};
+
+  const impact = getSignedAmountImpact(transaction.type, transaction.amount);
+  if (!impact) return {};
+
+  return { [String(transaction.account_id)]: impact };
+};
+
+const diffImpact = (oldImpact, newImpact) => {
+  const accountIds = new Set([...Object.keys(oldImpact), ...Object.keys(newImpact)]);
+  const delta = {};
+
+  for (const accountId of accountIds) {
+    const oldValue = Number(oldImpact[accountId] || 0);
+    const newValue = Number(newImpact[accountId] || 0);
+    const difference = newValue - oldValue;
+
+    if (difference !== 0) {
+      delta[accountId] = difference;
+    }
+  }
+
+  return delta;
 };
 
 const getAllTransactions = async (userId, filters = {}) => {
@@ -115,82 +205,39 @@ const getTransactionById = async (userId, id) => {
   return data;
 };
 
-const getAccountById = async (userId, accountId) => {
-  const { data, error } = await supabase
-    .from('accounts')
-    .select('id, opening_balance')
-    .eq('user_id', userId)
-    .eq('id', accountId)
-    .single();
+const resolveSingleTransactionAccountId = (payload) => {
+  const { type, account_id, from_account, to_account } = payload;
 
-  if (error || !data) {
-    throw createNotFoundError(`Account not found: ${accountId}`);
-  }
-
-  return data;
-};
-
-const setAccountBalance = async (userId, accountId, newBalance) => {
-  const { error } = await supabase
-    .from('accounts')
-    .update({ opening_balance: newBalance })
-    .eq('user_id', userId)
-    .eq('id', accountId);
-
-  if (error) {
-    throw new Error(`Failed to update account ${accountId}: ${error.message}`);
-  }
+  if (type === 'income' || type === 'expense') return account_id;
+  if (type === 'transfer_out') return from_account || account_id;
+  if (type === 'transfer_in') return to_account || account_id;
+  return account_id;
 };
 
 const createTransaction = async (userId, payload) => {
-  const { amount, type, account_id, from_account, to_account } = payload;
-  const sourceAccountId = from_account || account_id;
-  const destinationAccountId = to_account || account_id;
+  const numericAmount = toNumericAmount(payload.amount);
+  const accountId = resolveSingleTransactionAccountId(payload);
+
+  const deltaByAccountId = {};
+  if (accountId) {
+    deltaByAccountId[String(accountId)] = getSignedAmountImpact(payload.type, numericAmount);
+  }
+
+  const insertPayload = await sanitizeTransactionInsertPayload({
+    ...payload,
+    amount: numericAmount,
+    account_id: payload.account_id || accountId,
+    user_id: userId,
+  });
+
+  await applyBalanceDelta(userId, deltaByAccountId);
 
   try {
-    // Helper function to update account balance
-    const updateAccountBalance = async (acctId, delta) => {
-      const { data: account, error: fetchErr } = await supabase
-        .from('accounts')
-        .select('opening_balance')
-        .eq('user_id', userId)
-        .eq('id', acctId)
-        .single();
-
-      if (fetchErr) throw new Error(`Account not found: ${acctId}`);
-      
-      const newBalance = (account.opening_balance || 0) + delta;
-      const { error: updateErr } = await supabase
-        .from('accounts')
-        .update({ opening_balance: newBalance })
-        .eq('user_id', userId)
-        .eq('id', acctId);
-      
-      if (updateErr) throw new Error(`Failed to update account balance: ${updateErr.message}`);
-    };
-
-    // Update account balance based on transaction type
-    if (type === 'income' && account_id) {
-      await updateAccountBalance(account_id, amount);
-    } else if (type === 'expense' && account_id) {
-      await updateAccountBalance(account_id, -amount);
-    } else if (type === 'transfer_out' && sourceAccountId) {
-      await updateAccountBalance(sourceAccountId, -amount);
-    } else if (type === 'transfer_in' && destinationAccountId) {
-      await updateAccountBalance(destinationAccountId, amount);
-    }
-
-    const insertPayload = await sanitizeTransactionInsertPayload({
-      ...payload,
-      account_id: payload.account_id || sourceAccountId || destinationAccountId,
-      user_id: userId,
-    });
-
-    // Insert transaction
     const data = await insertTransactionsWithSchemaFallback([insertPayload]);
     return data[0] || null;
-  } catch (err) {
-    throw new Error(`Transaction creation failed: ${err.message}`);
+  } catch (error) {
+    await applyBalanceDelta(userId, invertDelta(deltaByAccountId));
+    throw new Error(`Transaction creation failed: ${error.message}`);
   }
 };
 
@@ -206,65 +253,68 @@ const createTransfer = async (userId, payload) => {
     note,
   } = payload;
 
-  const numericAmount = Number(amount);
-  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-    const error = new Error('Amount must be a positive number.');
-    error.status = 400;
-    throw error;
+  const numericAmount = toNumericAmount(amount);
+  if (numericAmount <= 0) {
+    throw createBadRequestError('Amount must be a positive number.');
   }
 
-  if (from_account === to_account) {
-    const error = new Error('from_account and to_account must be different.');
-    error.status = 400;
-    throw error;
+  if (!from_account || !to_account) {
+    throw createBadRequestError('from_account and to_account are required.');
   }
 
-  const sourceAccount = await getAccountById(userId, from_account);
-  const destinationAccount = await getAccountById(userId, to_account);
-  const transferRef = crypto.randomUUID();
+  if (String(from_account) === String(to_account)) {
+    throw createBadRequestError('from_account and to_account must be different.');
+  }
 
-  const sourceNewBalance = Number(sourceAccount.opening_balance || 0) - numericAmount;
-  const destinationNewBalance = Number(destinationAccount.opening_balance || 0) + numericAmount;
+  await getAccountById(userId, from_account);
+  await getAccountById(userId, to_account);
+
+  const transferReference = crypto.randomUUID();
+  const transferDelta = {
+    [String(from_account)]: -numericAmount,
+    [String(to_account)]: numericAmount,
+  };
+
+  const basePayload = {
+    date,
+    amount: numericAmount,
+    category_id,
+    subcategory_id,
+    description,
+    note,
+    user_id: userId,
+  };
+
+  const transferOutPayload = await sanitizeTransactionInsertPayload({
+    ...basePayload,
+    type: 'transfer_out',
+    account_id: from_account,
+  });
+
+  const transferInPayload = await sanitizeTransactionInsertPayload({
+    ...basePayload,
+    type: 'transfer_in',
+    account_id: to_account,
+  });
 
   let createdTransactions = [];
 
+  await applyBalanceDelta(userId, transferDelta);
+
   try {
-    await setAccountBalance(userId, sourceAccount.id, sourceNewBalance);
-    await setAccountBalance(userId, destinationAccount.id, destinationNewBalance);
-
-    const baseTransferPayload = {
-      date,
-      amount: numericAmount,
-      category_id,
-      subcategory_id,
-      description,
-      note,
-      user_id: userId,
-    };
-
-    const transferOutPayload = await sanitizeTransactionInsertPayload({
-      ...baseTransferPayload,
-      type: 'transfer_out',
-      account_id: from_account,
-    });
-
-    const transferInPayload = await sanitizeTransactionInsertPayload({
-      ...baseTransferPayload,
-      type: 'transfer_in',
-      account_id: to_account,
-    });
-
-    const data = await insertTransactionsWithSchemaFallback([transferOutPayload, transferInPayload]);
-    createdTransactions = data || [];
+    createdTransactions = await insertTransactionsWithSchemaFallback([
+      transferOutPayload,
+      transferInPayload,
+    ]);
 
     return {
-      reference: transferRef,
+      reference: transferReference,
       amount: numericAmount,
       from_account,
       to_account,
       transactions: createdTransactions,
     };
-  } catch (err) {
+  } catch (error) {
     try {
       if (createdTransactions.length > 0) {
         const createdIds = createdTransactions.map((transaction) => transaction.id);
@@ -275,44 +325,83 @@ const createTransfer = async (userId, payload) => {
           .in('id', createdIds);
       }
 
-      await setAccountBalance(userId, sourceAccount.id, Number(sourceAccount.opening_balance || 0));
-      await setAccountBalance(userId, destinationAccount.id, Number(destinationAccount.opening_balance || 0));
+      await applyBalanceDelta(userId, invertDelta(transferDelta));
     } catch (rollbackError) {
       throw new Error(`Transfer failed and rollback failed: ${rollbackError.message}`);
     }
 
-    const wrappedError = new Error(`Transfer creation failed: ${err.message}`);
-    wrappedError.status = err.status || 500;
+    const wrappedError = new Error(`Transfer creation failed: ${error.message}`);
+    wrappedError.status = error.status || 500;
     throw wrappedError;
   }
 };
 
 const updateTransaction = async (userId, id, payload) => {
-  const { data, error } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from('transactions')
-    .update(payload)
+    .select('*')
     .eq('user_id', userId)
     .eq('id', id)
-    .select(baseSelect)
     .maybeSingle();
 
-  if (error) throw error;
-  if (!data) throw createNotFoundError('Transaction not found.');
-  return data;
+  if (existingError) throw existingError;
+  if (!existing) throw createNotFoundError('Transaction not found.');
+
+  const merged = { ...existing, ...payload };
+  const oldImpact = getTransactionImpactByAccount(existing);
+  const newImpact = getTransactionImpactByAccount(merged);
+  const delta = diffImpact(oldImpact, newImpact);
+
+  await applyBalanceDelta(userId, delta);
+
+  try {
+    const { data, error } = await supabase
+      .from('transactions')
+      .update(payload)
+      .eq('user_id', userId)
+      .eq('id', id)
+      .select(baseSelect)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) throw createNotFoundError('Transaction not found.');
+    return data;
+  } catch (error) {
+    await applyBalanceDelta(userId, invertDelta(delta));
+    throw error;
+  }
 };
 
 const deleteTransaction = async (userId, id) => {
-  const { data, error } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from('transactions')
-    .delete()
+    .select('*')
     .eq('user_id', userId)
     .eq('id', id)
-    .select('id')
     .maybeSingle();
 
-  if (error) throw error;
-  if (!data) throw createNotFoundError('Transaction not found.');
-  return { success: true };
+  if (existingError) throw existingError;
+  if (!existing) throw createNotFoundError('Transaction not found.');
+
+  const reverseImpact = invertDelta(getTransactionImpactByAccount(existing));
+  await applyBalanceDelta(userId, reverseImpact);
+
+  try {
+    const { data, error } = await supabase
+      .from('transactions')
+      .delete()
+      .eq('user_id', userId)
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) throw createNotFoundError('Transaction not found.');
+    return { success: true };
+  } catch (error) {
+    await applyBalanceDelta(userId, invertDelta(reverseImpact));
+    throw error;
+  }
 };
 
 const getMonthlyStats = async (userId, month, year) => {
@@ -329,12 +418,12 @@ const getMonthlyStats = async (userId, month, year) => {
   if (error) throw error;
 
   const income = data
-    .filter((t) => t.type === 'income' || t.type === 'transfer_in')
-    .reduce((sum, t) => sum + Number(t.amount), 0);
+    .filter((transaction) => transaction.type === 'income' || transaction.type === 'transfer_in')
+    .reduce((sum, transaction) => sum + Number(transaction.amount), 0);
 
   const expenses = data
-    .filter((t) => t.type === 'expense' || t.type === 'transfer_out')
-    .reduce((sum, t) => sum + Number(t.amount), 0);
+    .filter((transaction) => transaction.type === 'expense' || transaction.type === 'transfer_out')
+    .reduce((sum, transaction) => sum + Number(transaction.amount), 0);
 
   return { income, expenses, net: income - expenses };
 };

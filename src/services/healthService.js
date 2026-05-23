@@ -6,9 +6,9 @@ const supabase = require('../config/supabase');
  */
 async function checkSupabaseHealth() {
   try {
-    // Simple query to keep connection active and verify it's working
+    // Lightweight connectivity check against a core table.
     const { data, error } = await supabase
-      .from('users')
+      .from('accounts')
       .select('id')
       .limit(1);
 

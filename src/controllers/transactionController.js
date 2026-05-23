@@ -48,7 +48,7 @@ exports.createTransaction = async (req, res) => {
     const transaction = await transactionService.createTransaction(req.user.id, req.body);
     res.status(201).json(transaction);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.status || 500).json({ error: error.message });
   }
 };
 
