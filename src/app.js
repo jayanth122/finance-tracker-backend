@@ -10,6 +10,7 @@ const authRoutes = require('./routes/authRoutes');
 const accountRoutes = require('./routes/accountRoutes');
 const categoryRoutes = require('./routes/categoryRoutes');
 const transactionRoutes = require('./routes/transactionRoutes');
+const { getHealthStatus } = require('./services/healthService');
 
 const app = express();
 
@@ -22,6 +23,7 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+const keepAliveIntervalMs = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 5 * 60 * 1000; // Default: 5 minutes
 
 app.disable('x-powered-by');
 
@@ -59,13 +61,34 @@ app.use('/api/accounts', accountRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/transactions', transactionRoutes);
 
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development',
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const health = await getHealthStatus();
+    const statusCode = health.status === 'ok' ? 200 : 503;
+    res.status(statusCode).json(health);
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      timestamp: new Date().toISOString(),
+      message: 'Failed to check health status',
+    });
+  }
+});
+
+// Keep-alive endpoint to maintain Supabase connection
+app.get('/api/keep-alive', async (req, res) => {
+  try {
+    const health = await getHealthStatus();
+    res.status(200).json({
+      message: 'Connection kept alive',
+      ...health,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: 'Keep-alive check failed',
+      error: err.message,
+    });
+  }
 });
 
 app.use((req, res) => {
@@ -91,10 +114,32 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
+  console.log(`Keep-alive interval: ${keepAliveIntervalMs}ms`);
 });
+
+// Set up keep-alive interval to maintain Supabase connection
+let keepAliveInterval;
+const startKeepAlive = async () => {
+  keepAliveInterval = setInterval(async () => {
+    try {
+      await getHealthStatus();
+      if (!isProduction) {
+        console.log('[Keep-Alive] Supabase connection check completed');
+      }
+    } catch (err) {
+      console.error('[Keep-Alive] Failed to check connection:', err.message);
+    }
+  }, keepAliveIntervalMs);
+};
+
+startKeepAlive();
 
 const shutdown = (signal) => {
   console.log(`Received ${signal}. Closing server...`);
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+  }
+  
   server.close(() => {
     console.log('HTTP server closed.');
     process.exit(0);
