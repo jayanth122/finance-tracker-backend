@@ -1,4 +1,5 @@
 const supabase = require('../config/supabase');
+const crypto = require('crypto');
 
 const createNotFoundError = (message) => {
   const error = new Error(message);
@@ -43,6 +44,33 @@ const getTransactionById = async (userId, id) => {
 
   if (error) throw error;
   return data;
+};
+
+const getAccountById = async (userId, accountId) => {
+  const { data, error } = await supabase
+    .from('accounts')
+    .select('id, opening_balance')
+    .eq('user_id', userId)
+    .eq('id', accountId)
+    .single();
+
+  if (error || !data) {
+    throw createNotFoundError(`Account not found: ${accountId}`);
+  }
+
+  return data;
+};
+
+const setAccountBalance = async (userId, accountId, newBalance) => {
+  const { error } = await supabase
+    .from('accounts')
+    .update({ opening_balance: newBalance })
+    .eq('user_id', userId)
+    .eq('id', accountId);
+
+  if (error) {
+    throw new Error(`Failed to update account ${accountId}: ${error.message}`);
+  }
 };
 
 const createTransaction = async (userId, payload) => {
@@ -92,6 +120,103 @@ const createTransaction = async (userId, payload) => {
     return data;
   } catch (err) {
     throw new Error(`Transaction creation failed: ${err.message}`);
+  }
+};
+
+const createTransfer = async (userId, payload) => {
+  const {
+    date,
+    amount,
+    from_account,
+    to_account,
+    category_id,
+    subcategory_id,
+    description,
+    note,
+  } = payload;
+
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    const error = new Error('Amount must be a positive number.');
+    error.status = 400;
+    throw error;
+  }
+
+  if (from_account === to_account) {
+    const error = new Error('from_account and to_account must be different.');
+    error.status = 400;
+    throw error;
+  }
+
+  const sourceAccount = await getAccountById(userId, from_account);
+  const destinationAccount = await getAccountById(userId, to_account);
+  const transferRef = crypto.randomUUID();
+
+  const sourceNewBalance = Number(sourceAccount.opening_balance || 0) - numericAmount;
+  const destinationNewBalance = Number(destinationAccount.opening_balance || 0) + numericAmount;
+
+  let createdTransactions = [];
+
+  try {
+    await setAccountBalance(userId, sourceAccount.id, sourceNewBalance);
+    await setAccountBalance(userId, destinationAccount.id, destinationNewBalance);
+
+    const baseTransferPayload = {
+      date,
+      amount: numericAmount,
+      from_account,
+      to_account,
+      category_id,
+      subcategory_id,
+      description,
+      note,
+      user_id: userId,
+    };
+
+    const { data, error } = await supabase
+      .from('transactions')
+      .insert([
+        {
+          ...baseTransferPayload,
+          type: 'transfer_out',
+          account_id: from_account,
+        },
+        {
+          ...baseTransferPayload,
+          type: 'transfer_in',
+          account_id: to_account,
+        },
+      ])
+      .select(baseSelect);
+
+    if (error) throw error;
+    createdTransactions = data || [];
+
+    return {
+      reference: transferRef,
+      amount: numericAmount,
+      from_account,
+      to_account,
+      transactions: createdTransactions,
+    };
+  } catch (err) {
+    try {
+      if (createdTransactions.length > 0) {
+        const createdIds = createdTransactions.map((transaction) => transaction.id);
+        await supabase
+          .from('transactions')
+          .delete()
+          .eq('user_id', userId)
+          .in('id', createdIds);
+      }
+
+      await setAccountBalance(userId, sourceAccount.id, Number(sourceAccount.opening_balance || 0));
+      await setAccountBalance(userId, destinationAccount.id, Number(destinationAccount.opening_balance || 0));
+    } catch (rollbackError) {
+      throw new Error(`Transfer failed and rollback failed: ${rollbackError.message}`);
+    }
+
+    throw new Error(`Transfer creation failed: ${err.message}`);
   }
 };
 
@@ -151,6 +276,7 @@ module.exports = {
   getAllTransactions,
   getTransactionById,
   createTransaction,
+  createTransfer,
   updateTransaction,
   deleteTransaction,
   getMonthlyStats,

@@ -52,6 +52,27 @@ exports.createTransaction = async (req, res) => {
   }
 };
 
+exports.createTransfer = async (req, res) => {
+  try {
+    const { date, amount, from_account, to_account } = req.body;
+
+    if (!date || amount === undefined || !from_account || !to_account) {
+      return res.status(400).json({
+        error: 'date, amount, from_account, and to_account are required.',
+      });
+    }
+
+    if (from_account === to_account) {
+      return res.status(400).json({ error: 'from_account and to_account must be different.' });
+    }
+
+    const transferResult = await transactionService.createTransfer(req.user.id, req.body);
+    res.status(201).json(transferResult);
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+};
+
 exports.updateTransaction = async (req, res) => {
   try {
     const { id, user_id, created_at, updated_at, ...payload } = req.body;
